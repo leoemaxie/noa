@@ -1,100 +1,87 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { getDoctorByEmail } from '@/lib/db'
-import { signInWithCognito, getCognitoConfig, getCognitoUser } from '@/lib/auth/cognito'
-import { setAuthCookies } from '@/lib/auth/cookies'
+import { NextRequest, NextResponse } from 'next/server';
+import {
+  signInWithCognito,
+  getCognitoConfig,
+  getCognitoUser,
+} from '@/lib/auth/cognito';
+import { setAuthCookies } from '@/lib/auth/cookies';
+import { isValidRole, type Role } from '@/lib/auth/roles';
+import { resolveUserProfile } from '@/lib/auth/profile';
+import { enforceRateLimit, getClientIdentifier } from '@/lib/ratelimit';
+import { loginSchema } from '@/lib/validations';
+import { apiError, zodValidationError } from '@/lib/api/response';
+import { API_ERROR_CODES } from '@/lib/types/api.types';
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { email, password, userType } = body
+    const rawBody = await request.json().catch(() => ({}));
+    const parseResult = loginSchema.safeParse(rawBody);
 
-    // Validate input
-    if (!email || !password) {
-      return NextResponse.json(
-        { message: 'Email and password are required' },
-        { status: 400 }
-      )
+    if (!parseResult.success) {
+      return zodValidationError(
+        parseResult.error,
+        'Email and password are required'
+      );
     }
 
-    const { isConfigured } = getCognitoConfig()
+    const { email, password, userType } = parseResult.data;
 
-    // 1. AWS Cognito Authentication
+    // Rate limiting: max 5 login attempts per minute per client (uses validated email)
+    const clientId = getClientIdentifier(request, email);
+    const rateLimitRes = await enforceRateLimit(`login:${clientId}`, {
+      limit: 5,
+      windowSeconds: 60,
+    });
+    if (rateLimitRes) return rateLimitRes;
+
+    const { isConfigured } = getCognitoConfig();
+
+    // 2. AWS Cognito Authentication
     if (isConfigured) {
-      const tokens = await signInWithCognito(email, password)
-      const cognitoUser = await getCognitoUser(tokens.accessToken)
+      const tokens = await signInWithCognito(email, password);
+      const cognitoUser = await getCognitoUser(tokens.accessToken);
 
-      let resolvedUser = {
-        id: cognitoUser?.sub || `user-${Date.now()}`,
-        email: email.trim().toLowerCase(),
-        name: cognitoUser?.name || email,
-        userType: (cognitoUser?.userType || userType || 'doctor') as 'doctor' | 'patient',
-      }
+      const canonicalId = cognitoUser?.sub || `user-${Date.now()}`;
+      const resolvedRole: Role =
+        cognitoUser?.userType && isValidRole(cognitoUser.userType)
+          ? cognitoUser.userType
+          : isValidRole(userType)
+            ? userType
+            : 'doctor';
 
-      // If doctor, cross-reference DynamoDB profile
-      if (resolvedUser.userType === 'doctor') {
-        const doctor = await getDoctorByEmail(email)
-        if (doctor) {
-          resolvedUser.id = doctor.id
-          resolvedUser.name = doctor.name
-        }
+      const profile = await resolveUserProfile(canonicalId, resolvedRole);
+
+      if (!profile) {
+        return apiError(
+          API_ERROR_CODES.UNAUTHORIZED,
+          'User profile not found in database',
+          401
+        );
       }
 
       const response = NextResponse.json({
         success: true,
         message: 'Login successful',
-        user: resolvedUser,
-      })
+        user: profile,
+      });
 
       // Set tamper-proof httpOnly secure session cookies
       return setAuthCookies(response, tokens, {
-        sub: resolvedUser.id,
-        email: resolvedUser.email,
-        name: resolvedUser.name,
-        userType: resolvedUser.userType,
-      })
+        sub: profile.id,
+        email: profile.email,
+        name: profile.name,
+        userType: profile.userType,
+      });
     }
 
-    // 2. Unconfigured Cognito Guard (Fail-fast transparency)
-    // In healthcare, we never silently bypass passwords unless explicitly configured for local test mode
-    if (process.env.ALLOW_DEV_AUTH === 'true' && process.env.NODE_ENV !== 'production') {
-      const doctor = await getDoctorByEmail(email)
-      if (!doctor) {
-        return NextResponse.json({ message: 'Doctor account not found' }, { status: 401 })
-      }
-
-      const devUser = {
-        sub: doctor.id,
-        email: doctor.email,
-        name: doctor.name,
-        userType: 'doctor' as const,
-      }
-
-      const devTokens = {
-        accessToken: `dev-token-${doctor.id}`,
-        idToken: `dev-id-${doctor.id}`,
-        expiresIn: 3600,
-      }
-
-      const response = NextResponse.json({
-        success: true,
-        message: 'Logged in via development auth bypass',
-        user: devUser,
-      })
-
-      return setAuthCookies(response, devTokens, devUser)
-    }
-
-    return NextResponse.json(
-      {
-        message: 'AWS Cognito User Pool is not configured. Please provision Cognito via Terraform or set COGNITO_USER_POOL_ID and COGNITO_CLIENT_ID.',
-      },
-      { status: 503 }
-    )
-  } catch (error: any) {
-    console.error('[Auth] Login error:', error?.message)
-    return NextResponse.json(
-      { message: error?.message || 'Login failed' },
-      { status: 401 }
-    )
+    return apiError(
+      API_ERROR_CODES.SERVICE_UNAVAILABLE,
+      'Authentication service is currently unavailable.',
+      503
+    );
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Login failed';
+    console.error('[Auth] Login error:', msg);
+    return apiError(API_ERROR_CODES.UNAUTHORIZED, msg, 401);
   }
 }

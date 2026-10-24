@@ -1,62 +1,111 @@
-import { NextResponse } from 'next/server'
-import type { NextRequest } from 'next/server'
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+import { getAuthenticatedUserSync } from '@/lib/auth/jwt';
+import {
+  getDashboardPath,
+  getRoleFromPath,
+  isValidRole,
+} from '@/lib/auth/roles';
+import { AUTH_COOKIE_NAMES } from '@/lib/auth/cookies';
 
 /**
- * Next.js Edge Middleware for Role-Based Access Control (RBAC)
- * Enforces HIPAA access controls before protected pages render.
+ * Next.js Edge Middleware — Role-Based Access Control
+ *
+ * Two-pattern enforcement:
+ * 1. Landing page (/): Redirect authenticated users to their dashboard.
+ *    Falls back to noa_session cookie if access token is expired but refresh token exists.
+ * 2. Protected routes (/dashboard/:role/*): Verify the token role matches the path role.
+ *    If token is expired but refresh token exists, allow through — client will refresh silently.
+ *
+ * Never add per-route ROUTE_GUARDS tables. The URL path segment IS the guard.
  */
+function continueWithHeaders(request: NextRequest) {
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set('x-pathname', request.nextUrl.pathname);
+  return NextResponse.next({
+    request: {
+      headers: requestHeaders,
+    },
+  });
+}
+
 export function middleware(request: NextRequest) {
-  const { pathname } = request.nextUrl
+  const { pathname } = request.nextUrl;
 
-  const sessionCookie = request.cookies.get('noa_session')?.value
-  const tokenCookie = request.cookies.get('noa_access_token')?.value
+  // ─── Landing Page ──────────────────────────────────────────────────────────
+  if (pathname === '/') {
+    const isPublicRequested =
+      request.nextUrl.searchParams.get('public') === 'true';
+    if (!isPublicRequested) {
+      const auth = getAuthenticatedUserSync(request);
 
-  const isAuthenticated = Boolean(sessionCookie || tokenCookie)
-  let userType: string | null = null
+      if (auth.isValid && isValidRole(auth.userType)) {
+        // Active valid token — redirect immediately
+        return NextResponse.redirect(
+          new URL(getDashboardPath(auth.userType), request.url)
+        );
+      }
 
-  if (sessionCookie) {
-    try {
-      const parsed = JSON.parse(sessionCookie)
-      userType = parsed.userType
-    } catch {
-      // Malformed cookie ignored
+      // Token expired or absent — try the 30-day session hint cookie
+      const hasRefreshToken = Boolean(
+        request.cookies.get(AUTH_COOKIE_NAMES.REFRESH_TOKEN)?.value
+      );
+      const sessionMeta = request.cookies.get(
+        AUTH_COOKIE_NAMES.SESSION_META
+      )?.value;
+      if (hasRefreshToken && sessionMeta) {
+        try {
+          const parsed = JSON.parse(sessionMeta) as Record<string, unknown>;
+          const hintedRole = parsed.userType;
+          if (isValidRole(hintedRole)) {
+            // Redirect to dashboard — it will silently refresh the token on load
+            return NextResponse.redirect(
+              new URL(getDashboardPath(hintedRole), request.url)
+            );
+          }
+        } catch {
+          // Malformed session cookie — fall through to landing page
+        }
+      }
     }
+    return continueWithHeaders(request);
   }
 
-  // 1. Protect Doctor Dashboard
-  if (pathname.startsWith('/dashboard/doctor')) {
-    if (!isAuthenticated) {
-      const loginUrl = new URL('/auth/login', request.url)
-      loginUrl.searchParams.set('userType', 'doctor')
-      loginUrl.searchParams.set('from', pathname)
-      return NextResponse.redirect(loginUrl)
-    }
-
-    if (userType && userType !== 'doctor') {
-      return NextResponse.redirect(new URL('/dashboard/patient', request.url))
-    }
+  // ─── Protected Dashboard Routes ─────────────────────────────────────────────
+  const targetRole = getRoleFromPath(pathname);
+  if (!targetRole) {
+    return continueWithHeaders(request);
   }
 
-  // 2. Protect Patient Dashboard
-  if (pathname.startsWith('/dashboard/patient')) {
-    if (!isAuthenticated) {
-      const loginUrl = new URL('/auth/login', request.url)
-      loginUrl.searchParams.set('userType', 'patient')
-      loginUrl.searchParams.set('from', pathname)
-      return NextResponse.redirect(loginUrl)
-    }
+  const auth = getAuthenticatedUserSync(request);
+  const hasRefreshToken = Boolean(
+    request.cookies.get(AUTH_COOKIE_NAMES.REFRESH_TOKEN)?.value
+  );
 
-    if (userType && userType !== 'patient') {
-      return NextResponse.redirect(new URL('/dashboard/doctor', request.url))
-    }
+  if (!auth.isValid) {
+    // Expired token with active refresh token — let the client-side http interceptor refresh
+    if (hasRefreshToken) return continueWithHeaders(request);
+    // Fully unauthenticated — redirect to login
+    return NextResponse.redirect(
+      new URL(`/auth/login?from=${encodeURIComponent(pathname)}`, request.url)
+    );
   }
 
-  return NextResponse.next()
+  // Valid token but wrong role for this path — send to their own dashboard
+  if (auth.userType !== targetRole) {
+    return NextResponse.redirect(
+      new URL(getDashboardPath(auth.userType), request.url)
+    );
+  }
+
+  return continueWithHeaders(request);
 }
 
 export const config = {
   matcher: [
+    '/',
     '/dashboard/doctor/:path*',
     '/dashboard/patient/:path*',
+    '/dashboard/admin/:path*',
   ],
-}
+};

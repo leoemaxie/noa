@@ -59,6 +59,11 @@ resource "aws_dynamodb_table" "noa_db" {
     projection_type = "KEYS_ONLY"
   }
 
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
   tags = merge(
     var.tags,
     {
@@ -261,13 +266,22 @@ resource "aws_iam_role_policy" "bedrock_policy" {
         Action = [
           "bedrock:InvokeModel",
           "bedrock:InvokeModelWithResponseStream",
-          "bedrock:ListFoundationModels"
+          "bedrock:ListFoundationModels",
+          "bedrock:GetInferenceProfile",
+          "bedrock:ListInferenceProfiles"
         ]
-        Resource = "arn:aws:bedrock:${var.aws_region}::foundation-model/*"
+        Resource = [
+          "arn:aws:bedrock:*::foundation-model/*",
+          "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
+          "arn:aws:bedrock:*::inference-profile/*"
+        ]
       },
       {
-        Effect   = "Allow"
-        Action   = ["bedrock:GetFoundationModel"]
+        Effect = "Allow"
+        Action = [
+          "bedrock:GetFoundationModel",
+          "bedrock:ListInferenceProfiles"
+        ]
         Resource = "*"
       }
     ]
@@ -327,6 +341,30 @@ resource "aws_iam_role_policy" "s3_policy" {
           "s3:ListAllMyBuckets"
         ]
         Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "cognito_policy" {
+  name = "${var.project_name}-cognito-policy"
+  role = aws_iam_role.app_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "cognito-idp:AdminConfirmSignUp",
+          "cognito-idp:AdminGetUser",
+          "cognito-idp:AdminUpdateUserAttributes",
+          "cognito-idp:AdminSetUserPassword",
+          "cognito-idp:AdminAddUserToGroup",
+          "cognito-idp:AdminRemoveUserFromGroup",
+          "cognito-idp:AdminUserGlobalSignOut"
+        ]
+        Resource = aws_cognito_user_pool.noa_user_pool.arn
       }
     ]
   })

@@ -1,82 +1,117 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest } from 'next/server';
 
-import type { ApiSuccess } from '@/lib/types/api.types'
-import type { DoctorProfile, DoctorProfileUpdateInput } from '@/lib/types/doctor.types'
-import { getDoctorById, updateDoctor } from '@/lib/db'
+import type {
+  DoctorProfile,
+  DoctorProfileUpdateInput,
+} from '@/lib/types/doctor.types';
+import { getDoctorById, updateDoctor, type Doctor } from '@/lib/db';
+import { requireAuth } from '@/lib/auth/guard';
+import { doctorProfileUpdateSchema } from '@/lib/validations';
+import {
+  apiError,
+  apiSuccess,
+  handleApiError,
+  zodValidationError,
+} from '@/lib/api/response';
+import { API_ERROR_CODES } from '@/lib/types/api.types';
 
-export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   try {
-    const { id } = await params
+    const guard = await requireAuth(request);
+    if (!guard.ok) return guard.response;
+
+    const { id } = await params;
 
     if (!id) {
-      return NextResponse.json({ message: 'Doctor ID is required' }, { status: 400 })
+      return apiError(
+        API_ERROR_CODES.BAD_REQUEST,
+        'Doctor ID is required',
+        400
+      );
     }
 
-    const doctor = await getDoctorById(id)
+    const doctor = await getDoctorById(id);
 
     if (!doctor) {
-      return NextResponse.json({ message: 'Doctor not found' }, { status: 404 })
+      return apiError(API_ERROR_CODES.NOT_FOUND, 'Doctor not found', 404);
     }
 
-    const response: ApiSuccess<DoctorProfile> = {
-      success: true,
-      data: doctor,
-    }
-
-    return NextResponse.json(response)
+    return apiSuccess<DoctorProfile>(doctor);
   } catch (error) {
-    console.error('[v0] Error fetching doctor:', error)
-    return NextResponse.json(
-      {
-        message: 'Failed to fetch doctor',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to fetch doctor');
   }
 }
 
-export async function PUT(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   try {
-    const { id } = await params
+    const guard = await requireAuth(request);
+    if (!guard.ok) return guard.response;
+    const { auth } = guard;
 
-    if (!id) {
-      return NextResponse.json({ message: 'Doctor ID is required' }, { status: 400 })
+    const { id } = await params;
+
+    // RBAC: Doctors can only edit their own profile; admins can edit any
+    if (auth.userType === 'doctor' && auth.sub !== id) {
+      return apiError(
+        API_ERROR_CODES.FORBIDDEN,
+        'Forbidden: You can only edit your own profile',
+        403
+      );
     }
 
-    const body = (await request.json()) as DoctorProfileUpdateInput
-    const updates = {
-      ...(body.name !== undefined ? { name: body.name } : {}),
-      ...(body.specialty !== undefined ? { specialty: body.specialty } : {}),
-      ...(body.clinic !== undefined ? { clinic: body.clinic } : {}),
-      ...(body.phone !== undefined ? { phone: body.phone } : {}),
-      ...(body.avatar !== undefined ? { avatar: body.avatar } : {}),
+    const rawBody = await request.json().catch(() => ({}));
+    const parseResult = doctorProfileUpdateSchema.safeParse(rawBody);
+
+    if (!parseResult.success) {
+      return zodValidationError(
+        parseResult.error,
+        'At least one profile field is required'
+      );
     }
 
-    if (Object.keys(updates).length === 0) {
-      return NextResponse.json({ message: 'At least one profile field is required' }, { status: 400 })
+    const body = parseResult.data;
+
+    // Whitelist allowed fields to prevent arbitrary writes
+    const updates: Partial<Doctor> = {};
+    if (body.name !== undefined) updates.name = body.name;
+    if (body.phone !== undefined) updates.phone = body.phone;
+    if (body.specialty !== undefined) updates.specialty = body.specialty;
+    if (body.clinic !== undefined) updates.clinic = body.clinic;
+    if (body.address !== undefined) updates.address = body.address;
+    if (body.bio !== undefined) updates.bio = body.bio;
+    if (body.avatar !== undefined) updates.avatar = body.avatar;
+
+    // If license details are updated, reset verification to pending
+    if (
+      body.license !== undefined ||
+      body.issuingAuthority !== undefined ||
+      body.licenseDocumentUrl !== undefined
+    ) {
+      if (body.license !== undefined) updates.license = body.license;
+      if (body.issuingAuthority !== undefined)
+        updates.issuingAuthority = body.issuingAuthority;
+      if (body.licenseDocumentUrl !== undefined)
+        updates.licenseDocumentUrl = body.licenseDocumentUrl;
+
+      // Resubmitting credentials resets status to 'pending' for re-review
+      updates.verificationStatus = 'pending';
+      updates.rejectionReason = '';
     }
 
-    const updatedDoctor = await updateDoctor(id, updates)
+    const updatedDoctor = await updateDoctor(id, updates);
 
     if (!updatedDoctor) {
-      return NextResponse.json({ message: 'Doctor not found' }, { status: 404 })
+      return apiError(API_ERROR_CODES.NOT_FOUND, 'Doctor not found', 404);
     }
 
-    const response: ApiSuccess<DoctorProfile> = {
-      success: true,
-      data: updatedDoctor,
-    }
-
-    return NextResponse.json(response)
+    return apiSuccess<DoctorProfile>(updatedDoctor);
   } catch (error) {
-    console.error('[v0] Error updating doctor:', error)
-    return NextResponse.json(
-      {
-        message: 'Failed to update doctor',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to update doctor');
   }
 }

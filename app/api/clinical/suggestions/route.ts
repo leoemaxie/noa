@@ -1,25 +1,28 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { getClinicaSuggestions } from '@/lib/voice-service'
-import { checkRateLimit, getClientIdentifier, rateLimitResponse } from '@/lib/ratelimit'
-import { ClinicalAIUnavailableError } from '@/lib/ai/provider'
+import { NextRequest } from 'next/server';
+import { getClinicaSuggestions } from '@/lib/voice-service';
+import { requireAuth } from '@/lib/auth/guard';
+import { apiError, apiSuccess, handleApiError } from '@/lib/api/response';
+import { API_ERROR_CODES } from '@/lib/types/api.types';
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { transcript, sessionId, patientHistory, currentSymptoms } = body
+    const guard = await requireAuth(request, undefined, {
+      prefix: 'suggestions',
+      limit: 20,
+      windowSeconds: 60,
+    });
+    if (!guard.ok) return guard.response;
+    const { auth } = guard;
+
+    const body = await request.json();
+    const { transcript, sessionId, patientHistory, currentSymptoms } = body;
 
     if (!transcript) {
-      return NextResponse.json(
-        { error: 'Transcript is required' },
-        { status: 400 }
-      )
-    }
-
-    // Rate limiting: max 20 requests per minute per client
-    const clientId = getClientIdentifier(request)
-    const rateCheck = await checkRateLimit(clientId, { limit: 20, windowSeconds: 60 })
-    if (!rateCheck.success) {
-      return rateLimitResponse(rateCheck)
+      return apiError(
+        API_ERROR_CODES.BAD_REQUEST,
+        'Transcript is required',
+        400
+      );
     }
 
     // Generate suggestions using Nova Sonic
@@ -27,27 +30,13 @@ export async function POST(request: NextRequest) {
       transcript,
       patientHistory || '',
       currentSymptoms || transcript
-    )
+    );
 
-    return NextResponse.json({
-      success: true,
+    return apiSuccess({
       suggestions,
       sessionId,
-    })
+    });
   } catch (error) {
-    console.error('[v0] Error generating suggestions:', error)
-    if (error instanceof ClinicalAIUnavailableError && error.isThrottling) {
-      return NextResponse.json(
-        { error: 'Too Many Requests', message: 'AWS Bedrock model capacity exceeded. Please retry in a few moments.' },
-        { status: 429, headers: { 'Retry-After': '5' } }
-      )
-    }
-    return NextResponse.json(
-      {
-        error: 'Failed to generate suggestions',
-        message: error instanceof Error ? error.message : 'Unknown error',
-      },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to generate suggestions');
   }
 }

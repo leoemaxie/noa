@@ -1,0 +1,226 @@
+'use client';
+
+import { useState } from 'react';
+import type { IntakeConversationDraft } from '@/lib/voice-service';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import {
+  CheckCircle2,
+  Clock,
+  MessageSquare,
+  ChevronDown,
+  ChevronUp,
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+
+type RightPanelProps = {
+  draft: IntakeConversationDraft;
+  chatItems: Array<{
+    id: string;
+    role: 'assistant' | 'patient' | 'system';
+    text: string;
+  }>;
+  isComplete?: boolean;
+  isSubmitting?: boolean;
+  onFinalize?: () => void;
+};
+
+export function ClinicalIntakeCard({
+  draft,
+  chatItems,
+  isComplete,
+  isSubmitting,
+  onFinalize,
+}: RightPanelProps) {
+  const [showHistory, setShowHistory] = useState(false);
+  const [isMobileExpanded, setIsMobileExpanded] = useState(true);
+
+  const safeFormatList = (val: unknown): string => {
+    if (Array.isArray(val)) return val.filter(Boolean).join(', ');
+    if (typeof val === 'string') return val.trim();
+    return '';
+  };
+
+  const safeFormatText = (val: unknown): string => {
+    if (typeof val === 'string') return val.trim();
+    if (val !== null && val !== undefined) return String(val).trim();
+    return '';
+  };
+
+  const fields = [
+    {
+      label: 'Full Name',
+      value:
+        `${safeFormatText(draft?.firstName)} ${safeFormatText(draft?.lastName)}`.trim(),
+    },
+    { label: 'Date of Birth', value: safeFormatText(draft?.dateOfBirth) },
+    {
+      label: 'Phone',
+      value:
+        safeFormatText(draft?.phone) ||
+        (draft?.email ? 'Optional / Not provided' : ''),
+    },
+    {
+      label: 'Email',
+      value:
+        safeFormatText(draft?.email) ||
+        (draft?.phone ? 'Optional / Not provided' : ''),
+    },
+    { label: 'Reason for Visit', value: safeFormatText(draft?.chiefComplaint) },
+    { label: 'Conditions', value: safeFormatList(draft?.medicalConditions) },
+    { label: 'Medications', value: safeFormatList(draft?.currentMedications) },
+    { label: 'Allergies', value: safeFormatList(draft?.allergies) },
+    {
+      label: 'Emergency Contact',
+      value: safeFormatText(draft?.emergencyContactName),
+    },
+  ];
+
+  const capturedCount = fields.filter((f) =>
+    Boolean(f.value && f.value.length > 0)
+  ).length;
+  const percentComplete = Math.round((capturedCount / fields.length) * 100);
+
+  return (
+    <div className="border-deep-ink/10 flex h-full w-full min-w-0 flex-col justify-between overflow-hidden rounded-2xl border bg-white p-3 shadow-sm sm:rounded-3xl sm:p-4">
+      {/* Header & Progress with Mobile Accordion Toggle */}
+      <div className="space-y-1.5 pb-2">
+        <div
+          onClick={() => setIsMobileExpanded((prev) => !prev)}
+          className="flex cursor-pointer items-center justify-between sm:cursor-default"
+          role="button"
+          tabIndex={0}
+          aria-expanded={isMobileExpanded}
+        >
+          <div className="flex items-center gap-1.5">
+            <h2 className="text-deep-ink font-serif text-xs font-bold sm:text-sm">
+              Captured Information
+            </h2>
+            <ChevronDown
+              className={cn(
+                'text-slate h-3.5 w-3.5 transition-transform duration-200 sm:hidden',
+                isMobileExpanded && 'rotate-180'
+              )}
+            />
+          </div>
+          <Badge
+            variant="default"
+            className="text-[10px] font-bold sm:text-[11px]"
+          >
+            {capturedCount} of {fields.length} ({percentComplete}%)
+          </Badge>
+        </div>
+
+        <div className="bg-soft-meadow h-1.5 w-full overflow-hidden rounded-full">
+          <div
+            className="bg-deep-ink h-full rounded-full transition-all duration-300"
+            style={{ width: `${percentComplete}%` }}
+          />
+        </div>
+
+        {(percentComplete === 100 || isComplete) && onFinalize && (
+          <Button
+            type="button"
+            onClick={onFinalize}
+            disabled={isSubmitting}
+            className="bg-moss-green hover:bg-moss-green/90 mt-2 flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold text-white shadow-xs transition-all disabled:opacity-50"
+          >
+            <CheckCircle2 className="h-4 w-4" />
+            <span>
+              {isComplete
+                ? 'Intake Complete — Finalizing…'
+                : 'Finalize Intake & View Summary'}
+            </span>
+          </Button>
+        )}
+      </div>
+
+      {/* Extracted Fields Table: Responsive wrapping without horizontal overflow */}
+      <div
+        className={cn(
+          'min-w-0 flex-1 space-y-1 overflow-x-hidden overflow-y-auto py-1 sm:block sm:space-y-1.5',
+          isMobileExpanded ? 'block max-h-60 sm:max-h-none' : 'hidden'
+        )}
+      >
+        {fields.map((field) => {
+          const isCaptured = Boolean(field.value && field.value.trim());
+          return (
+            <div
+              key={field.label}
+              className="bg-canvas flex w-full min-w-0 items-start justify-between gap-2.5 rounded-xl px-2.5 py-1.5 text-xs transition-colors sm:px-3"
+            >
+              <div className="flex shrink-0 items-center gap-1.5 pt-0.5">
+                {isCaptured ? (
+                  <CheckCircle2 className="text-moss-green h-3.5 w-3.5 shrink-0" />
+                ) : (
+                  <Clock className="text-slate/40 h-3.5 w-3.5 shrink-0" />
+                )}
+                <span
+                  className={
+                    isCaptured ? 'text-deep-ink font-medium' : 'text-slate'
+                  }
+                >
+                  {field.label}
+                </span>
+              </div>
+              <span
+                className={cn(
+                  'max-w-[62%] min-w-0 text-right font-medium break-words',
+                  isCaptured ? 'text-deep-ink' : 'text-slate/40 italic'
+                )}
+              >
+                {field.value || 'Pending'}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* History Drawer Toggle at Bottom */}
+      <div className="border-deep-ink/8 min-w-0 shrink-0 border-t pt-2">
+        <Button
+          type="button"
+          variant="ghost"
+          onClick={() => setShowHistory(!showHistory)}
+          className="bg-soft-meadow/50 hover:bg-soft-meadow text-slate hover:text-deep-ink flex h-auto w-full cursor-pointer items-center justify-between rounded-xl px-2.5 py-1.5 text-xs"
+        >
+          <span className="flex items-center gap-1.5 text-[11px] font-medium">
+            <MessageSquare className="h-3.5 w-3.5" />
+            <span>Dialogue History ({chatItems.length})</span>
+          </span>
+          {showHistory ? (
+            <ChevronDown className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronUp className="h-3.5 w-3.5" />
+          )}
+        </Button>
+
+        {showHistory && (
+          <div className="mt-2 max-h-32 min-w-0 space-y-1.5 overflow-x-hidden overflow-y-auto pr-1 sm:max-h-40">
+            {chatItems.map((item) => (
+              <div
+                key={item.id}
+                className={cn(
+                  'min-w-0 rounded-lg px-2.5 py-1.5 text-[11px] leading-snug break-words',
+                  item.role === 'assistant'
+                    ? 'bg-soft-meadow/70 text-deep-ink'
+                    : 'bg-canvas text-deep-ink border-deep-ink/10 border'
+                )}
+              >
+                <span className="text-slate block text-[10px] font-semibold uppercase">
+                  {item.role === 'assistant' ? 'Noa' : 'You'}
+                </span>
+                <span>{item.text}</span>
+              </div>
+            ))}
+            {chatItems.length === 0 && (
+              <p className="text-slate/60 py-2 text-center text-[11px] italic">
+                No messages yet.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

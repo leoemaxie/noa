@@ -3,13 +3,11 @@
  * Initializes and registers all server-side callable tools.
  */
 
-import { WebMCPRegistry } from '../core/registry'
-import { registerClinicalTools } from './clinical-tools'
-import { registerIntakeTools } from './intake-tools'
-import { registerDatabaseTools } from './database-tools'
+import { WebMCPRegistry } from '../core/registry';
+import { registerClinicalTools } from './clinical';
+import { registerIntakeTools } from './intake';
 
 export function registerAllTools(registry: WebMCPRegistry): void {
-  registerClinicalTools(registry)
-  registerIntakeTools(registry)
-  registerDatabaseTools(registry)
+  registerClinicalTools(registry);
+  registerIntakeTools(registry);
 }

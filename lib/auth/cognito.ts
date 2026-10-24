@@ -1,9 +1,5 @@
 /**
- * Modern Server-Side AWS Cognito Authentication Engine
- * Powered by AWS SDK v3 (@aws-sdk/client-cognito-identity-provider)
- * 
- * Replaces legacy amazon-cognito-identity-js with server-side SDK commands
- * and strict password verification.
+ * Server-Side AWS Cognito Authentication Engine
  */
 
 import {
@@ -11,43 +7,77 @@ import {
   InitiateAuthCommand,
   SignUpCommand,
   ConfirmSignUpCommand,
+  AdminConfirmSignUpCommand,
   GlobalSignOutCommand,
+  AdminUserGlobalSignOutCommand,
+  AdminAddUserToGroupCommand,
+  AdminRemoveUserFromGroupCommand,
   GetUserCommand,
+  ForgotPasswordCommand,
+  ConfirmForgotPasswordCommand,
   AuthFlowType,
-} from '@aws-sdk/client-cognito-identity-provider'
-import { getAwsCredentials } from '@/lib/aws-config'
+} from '@aws-sdk/client-cognito-identity-provider';
+import { createCredentialProvider, getAwsCredentials } from '@/lib/aws-config';
 
-const region = process.env.AWS_REGION || 'us-east-1'
-const credentials = getAwsCredentials(region)
+const region = process.env.AWS_REGION || 'us-east-1';
+const hasCredentialsConfigured = Boolean(
+  (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) ||
+  (process.env.VERCEL_OIDC_TOKEN && process.env.AWS_ROLE_ARN)
+);
 
 export const cognitoClient = new CognitoIdentityProviderClient({
   region,
-  ...(credentials ? { credentials } : {}),
-})
+  ...(hasCredentialsConfigured
+    ? { credentials: createCredentialProvider(region) }
+    : {}),
+});
+
+export function getCognitoErrorName(error: unknown): string | undefined {
+  if (error && typeof error === 'object' && 'name' in error) {
+    return String((error as { name: unknown }).name);
+  }
+  return undefined;
+}
+
+export function getCognitoErrorMessage(
+  error: unknown,
+  fallback = 'Authentication failed'
+): string {
+  if (error instanceof Error) return error.message;
+  return fallback;
+}
 
 export function getCognitoConfig() {
-  const userPoolId = process.env.COGNITO_USER_POOL_ID || process.env.NEXT_PUBLIC_COGNITO_USER_POOL_ID || ''
-  const clientId = process.env.COGNITO_CLIENT_ID || process.env.NEXT_PUBLIC_COGNITO_CLIENT_ID || ''
+  const userPoolId = process.env.COGNITO_USER_POOL_ID || '';
+  const clientId = process.env.COGNITO_CLIENT_ID || '';
 
   return {
     userPoolId,
     clientId,
     isConfigured: Boolean(userPoolId && clientId),
+  };
+}
+
+function ensureCognitoConfigured(): { userPoolId: string; clientId: string } {
+  const config = getCognitoConfig();
+  if (!config.isConfigured) {
+    throw new Error('Service is currently unavailable.');
   }
+  return config;
 }
 
 export interface CognitoTokens {
-  accessToken: string
-  idToken: string
-  refreshToken?: string
-  expiresIn: number
+  accessToken: string;
+  idToken: string;
+  refreshToken?: string;
+  expiresIn: number;
 }
 
 export interface CognitoUserSession {
-  sub: string
-  email: string
-  name: string
-  userType: 'doctor' | 'patient'
+  sub: string;
+  email: string;
+  name: string;
+  userType: 'doctor' | 'patient' | 'admin';
 }
 
 /**
@@ -57,11 +87,7 @@ export async function signInWithCognito(
   email: string,
   password: string
 ): Promise<CognitoTokens> {
-  const { clientId, isConfigured } = getCognitoConfig()
-
-  if (!isConfigured) {
-    throw new Error('AWS Cognito is not configured. Please set COGNITO_USER_POOL_ID and COGNITO_CLIENT_ID.')
-  }
+  const { clientId } = ensureCognitoConfigured();
 
   try {
     const command = new InitiateAuthCommand({
@@ -71,12 +97,15 @@ export async function signInWithCognito(
         USERNAME: email.trim().toLowerCase(),
         PASSWORD: password,
       },
-    })
+    });
 
-    const response = await cognitoClient.send(command)
+    const response = await cognitoClient.send(command);
 
-    if (!response.AuthenticationResult?.AccessToken || !response.AuthenticationResult?.IdToken) {
-      throw new Error('Authentication failed: No tokens returned by Cognito')
+    if (
+      !response.AuthenticationResult?.AccessToken ||
+      !response.AuthenticationResult?.IdToken
+    ) {
+      throw new Error('Authentication failed');
     }
 
     return {
@@ -84,19 +113,66 @@ export async function signInWithCognito(
       idToken: response.AuthenticationResult.IdToken,
       refreshToken: response.AuthenticationResult.RefreshToken,
       expiresIn: response.AuthenticationResult.ExpiresIn || 3600,
+    };
+  } catch (error) {
+    const errorName = getCognitoErrorName(error);
+    const errorMsg = getCognitoErrorMessage(error);
+    console.error('[Cognito] Sign-in error:', errorName, errorMsg);
+    if (
+      errorName === 'NotAuthorizedException' ||
+      errorName === 'UserNotFoundException'
+    ) {
+      throw new Error('Incorrect email or password.');
     }
-  } catch (error: any) {
-    console.error('[Cognito] Sign-in error:', error?.name, error?.message)
-    if (error?.name === 'NotAuthorizedException') {
-      throw new Error('Incorrect email or password.')
+    if (errorName === 'UserNotConfirmedException') {
+      throw new Error(
+        'Account email is not verified yet. Please check your verification code.'
+      );
     }
-    if (error?.name === 'UserNotFoundException') {
-      throw new Error('No account found with this email address.')
+    throw new Error(errorMsg);
+  }
+}
+
+/**
+ * Refresh Cognito session tokens using an active refresh token
+ */
+export async function refreshCognitoTokens(
+  refreshToken: string
+): Promise<CognitoTokens> {
+  const { clientId } = ensureCognitoConfigured();
+
+  try {
+    const command = new InitiateAuthCommand({
+      AuthFlow: AuthFlowType.REFRESH_TOKEN_AUTH,
+      ClientId: clientId,
+      AuthParameters: {
+        REFRESH_TOKEN: refreshToken,
+      },
+    });
+
+    const response = await cognitoClient.send(command);
+
+    if (
+      !response.AuthenticationResult?.AccessToken ||
+      !response.AuthenticationResult?.IdToken
+    ) {
+      throw new Error('Failed to refresh tokens');
     }
-    if (error?.name === 'UserNotConfirmedException') {
-      throw new Error('Account email is not verified yet. Please check your verification code.')
-    }
-    throw new Error(error?.message || 'Authentication failed')
+
+    return {
+      accessToken: response.AuthenticationResult.AccessToken,
+      idToken: response.AuthenticationResult.IdToken,
+      refreshToken: response.AuthenticationResult.RefreshToken || refreshToken,
+      expiresIn: response.AuthenticationResult.ExpiresIn || 3600,
+    };
+  } catch (error) {
+    const errorName = getCognitoErrorName(error);
+    const errorMsg = getCognitoErrorMessage(
+      error,
+      'Failed to refresh authentication session'
+    );
+    console.error('[Cognito] Refresh token error:', errorName, errorMsg);
+    throw new Error(errorMsg);
   }
 }
 
@@ -110,17 +186,13 @@ export async function signUpWithCognito({
   firstName,
   lastName,
 }: {
-  email: string
-  password: string
-  userType: 'doctor' | 'patient'
-  firstName: string
-  lastName: string
+  email: string;
+  password: string;
+  userType: 'doctor' | 'patient';
+  firstName: string;
+  lastName: string;
 }): Promise<{ userSub: string; isConfirmed: boolean }> {
-  const { clientId, isConfigured } = getCognitoConfig()
-
-  if (!isConfigured) {
-    throw new Error('AWS Cognito is not configured. Please set COGNITO_USER_POOL_ID and COGNITO_CLIENT_ID.')
-  }
+  const { clientId } = ensureCognitoConfigured();
 
   try {
     const command = new SignUpCommand({
@@ -133,23 +205,25 @@ export async function signUpWithCognito({
         { Name: 'family_name', Value: lastName.trim() },
         { Name: 'custom:user_type', Value: userType },
       ],
-    })
+    });
 
-    const response = await cognitoClient.send(command)
+    const response = await cognitoClient.send(command);
 
     return {
       userSub: response.UserSub || '',
       isConfirmed: Boolean(response.UserConfirmed),
+    };
+  } catch (error) {
+    const errorName = getCognitoErrorName(error);
+    const errorMsg = getCognitoErrorMessage(error, 'Registration failed');
+    console.error('[Cognito] Sign-up error:', errorName, errorMsg);
+    if (errorName === 'UsernameExistsException') {
+      throw new Error('An account with this email already exists.');
     }
-  } catch (error: any) {
-    console.error('[Cognito] Sign-up error:', error?.name, error?.message)
-    if (error?.name === 'UsernameExistsException') {
-      throw new Error('An account with this email already exists.')
+    if (errorName === 'InvalidPasswordException') {
+      throw new Error('Password must be at least 6 characters long.');
     }
-    if (error?.name === 'InvalidPasswordException') {
-      throw new Error('Password must be at least 8 characters long and contain uppercase, lowercase, numbers, and symbols.')
-    }
-    throw new Error(error?.message || 'Registration failed')
+    throw new Error(errorMsg);
   }
 }
 
@@ -160,30 +234,30 @@ export async function confirmCognitoSignUp(
   email: string,
   code: string
 ): Promise<{ success: boolean }> {
-  const { clientId, isConfigured } = getCognitoConfig()
-
-  if (!isConfigured) {
-    throw new Error('AWS Cognito is not configured.')
-  }
+  const { clientId } = ensureCognitoConfigured();
 
   try {
     const command = new ConfirmSignUpCommand({
       ClientId: clientId,
       Username: email.trim().toLowerCase(),
       ConfirmationCode: code.trim(),
-    })
+    });
 
-    await cognitoClient.send(command)
-    return { success: true }
-  } catch (error: any) {
-    console.error('[Cognito] Confirmation error:', error)
-    if (error?.name === 'CodeMismatchException') {
-      throw new Error('Invalid verification code.')
+    await cognitoClient.send(command);
+    return { success: true };
+  } catch (error) {
+    const errorName = getCognitoErrorName(error);
+    const errorMsg = getCognitoErrorMessage(error, 'Verification failed');
+    console.error('[Cognito] Confirmation error:', error);
+    if (errorName === 'CodeMismatchException') {
+      throw new Error('Invalid verification code.');
     }
-    if (error?.name === 'ExpiredCodeException') {
-      throw new Error('Verification code has expired. Please request a new code.')
+    if (errorName === 'ExpiredCodeException') {
+      throw new Error(
+        'Verification code has expired. Please request a new code.'
+      );
     }
-    throw new Error(error?.message || 'Verification failed')
+    throw new Error(errorMsg);
   }
 }
 
@@ -194,39 +268,208 @@ export async function signOutWithCognito(accessToken: string): Promise<void> {
   try {
     const command = new GlobalSignOutCommand({
       AccessToken: accessToken,
-    })
-    await cognitoClient.send(command)
+    });
+    await cognitoClient.send(command);
   } catch (error) {
     // Log warning but allow client session clearance to proceed
-    console.warn('[Cognito] Global sign-out warning:', error)
+    console.warn('[Cognito] Global sign-out warning:', error);
   }
 }
 
 /**
  * Fetch user profile & custom attributes from an active access token
  */
-export async function getCognitoUser(accessToken: string): Promise<CognitoUserSession | null> {
+export async function getCognitoUser(
+  accessToken: string
+): Promise<CognitoUserSession | null> {
   try {
     const command = new GetUserCommand({
       AccessToken: accessToken,
-    })
+    });
 
-    const response = await cognitoClient.send(command)
-    const attrs = response.UserAttributes || []
+    const response = await cognitoClient.send(command);
+    const attrs = response.UserAttributes || [];
 
-    const sub = attrs.find(a => a.Name === 'sub')?.Value || ''
-    const email = attrs.find(a => a.Name === 'email')?.Value || response.Username || ''
-    const firstName = attrs.find(a => a.Name === 'given_name')?.Value || ''
-    const lastName = attrs.find(a => a.Name === 'family_name')?.Value || ''
-    const userType = (attrs.find(a => a.Name === 'custom:user_type')?.Value as 'doctor' | 'patient') || 'patient'
+    const sub = attrs.find((a) => a.Name === 'sub')?.Value || '';
+    const email =
+      attrs.find((a) => a.Name === 'email')?.Value || response.Username || '';
+    const firstName = attrs.find((a) => a.Name === 'given_name')?.Value || '';
+    const lastName = attrs.find((a) => a.Name === 'family_name')?.Value || '';
+    const rawType = attrs.find((a) => a.Name === 'custom:user_type')?.Value;
+    const userType =
+      rawType === 'admin' || rawType === 'doctor' || rawType === 'patient'
+        ? rawType
+        : 'patient';
 
     return {
       sub,
       email,
       name: `${firstName} ${lastName}`.trim() || email,
       userType,
-    }
+    };
   } catch (error) {
-    return null
+    return null;
+  }
+}
+
+/**
+ * Initiate password reset request by sending a verification code to the user's email
+ */
+export async function forgotPasswordWithCognito(
+  email: string
+): Promise<{ destination?: string }> {
+  const { clientId } = ensureCognitoConfigured();
+
+  try {
+    const command = new ForgotPasswordCommand({
+      ClientId: clientId,
+      Username: email.trim().toLowerCase(),
+    });
+
+    const response = await cognitoClient.send(command);
+    return {
+      destination: response.CodeDeliveryDetails?.Destination,
+    };
+  } catch (error) {
+    const errorName = getCognitoErrorName(error);
+    const errorMsg = getCognitoErrorMessage(
+      error,
+      'Failed to request password reset.'
+    );
+    console.error('[Cognito] Forgot-password error:', errorName, errorMsg);
+    if (errorName === 'UserNotFoundException') {
+      throw new Error('No account found with this email address.');
+    }
+    if (errorName === 'LimitExceededException') {
+      throw new Error('Attempt limit exceeded. Please try again later.');
+    }
+    if (errorName === 'InvalidParameterException') {
+      throw new Error('Invalid email parameter.');
+    }
+    throw new Error(errorMsg);
+  }
+}
+
+/**
+ * Confirm password reset using the verification code and new password
+ */
+export async function confirmForgotPasswordWithCognito({
+  email,
+  code,
+  newPassword,
+}: {
+  email: string;
+  code: string;
+  newPassword: string;
+}): Promise<{ success: boolean }> {
+  const { clientId } = ensureCognitoConfigured();
+
+  try {
+    const command = new ConfirmForgotPasswordCommand({
+      ClientId: clientId,
+      Username: email.trim().toLowerCase(),
+      ConfirmationCode: code.trim(),
+      Password: newPassword,
+    });
+
+    await cognitoClient.send(command);
+    return { success: true };
+  } catch (error) {
+    const errorName = getCognitoErrorName(error);
+    const errorMsg = getCognitoErrorMessage(error, 'Failed to reset password.');
+    console.error(
+      '[Cognito] Confirm-forgot-password error:',
+      errorName,
+      errorMsg
+    );
+    if (errorName === 'CodeMismatchException') {
+      throw new Error('Invalid verification code. Please check and try again.');
+    }
+    if (errorName === 'ExpiredCodeException') {
+      throw new Error(
+        'Verification code has expired. Please request a new one.'
+      );
+    }
+    if (errorName === 'InvalidPasswordException') {
+      throw new Error(
+        'Password does not meet requirements (must be at least 6 characters).'
+      );
+    }
+    if (errorName === 'UserNotFoundException') {
+      throw new Error('No user found for this email address.');
+    }
+    throw new Error(errorMsg);
+  }
+}
+
+/**
+ * Revoke all active sessions and refresh tokens for a user across all devices
+ */
+export async function revokeAllUserSessions(email: string): Promise<void> {
+  const { userPoolId, isConfigured } = getCognitoConfig();
+  if (!isConfigured || !userPoolId) return;
+
+  try {
+    const command = new AdminUserGlobalSignOutCommand({
+      UserPoolId: userPoolId,
+      Username: email.trim().toLowerCase(),
+    });
+    await cognitoClient.send(command);
+  } catch (error) {
+    console.warn('[Cognito] Failed to perform admin global sign-out:', error);
+  }
+}
+
+/**
+ * Add a Cognito user to a specific group (e.g. Doctors, Admins)
+ */
+export async function addUserToCognitoGroup(
+  username: string,
+  groupName: string
+): Promise<void> {
+  const { userPoolId, isConfigured } = getCognitoConfig();
+  if (!isConfigured || !userPoolId) return;
+
+  try {
+    const command = new AdminAddUserToGroupCommand({
+      UserPoolId: userPoolId,
+      Username: username.trim().toLowerCase(),
+      GroupName: groupName,
+    });
+    await cognitoClient.send(command);
+  } catch (error) {
+    const errorMsg = getCognitoErrorMessage(error);
+    console.error(
+      `[Cognito] Failed to add user ${username} to group ${groupName}:`,
+      errorMsg
+    );
+    throw error;
+  }
+}
+
+/**
+ * Remove a Cognito user from a specific group
+ */
+export async function removeUserFromCognitoGroup(
+  username: string,
+  groupName: string
+): Promise<void> {
+  const { userPoolId, isConfigured } = getCognitoConfig();
+  if (!isConfigured || !userPoolId) return;
+
+  try {
+    const command = new AdminRemoveUserFromGroupCommand({
+      UserPoolId: userPoolId,
+      Username: username.trim().toLowerCase(),
+      GroupName: groupName,
+    });
+    await cognitoClient.send(command);
+  } catch (error) {
+    const errorMsg = getCognitoErrorMessage(error);
+    console.error(
+      `[Cognito] Failed to remove user ${username} from group ${groupName}:`,
+      errorMsg
+    );
+    throw error;
   }
 }

@@ -1,47 +1,25 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { AUTH_COOKIE_NAMES } from '@/lib/auth/cookies'
-import { getCognitoUser } from '@/lib/auth/cognito'
+import { NextRequest, NextResponse } from 'next/server';
+import { requireAuth } from '@/lib/auth/guard';
+import { resolveUserProfile } from '@/lib/auth/profile';
 
+/**
+ * GET /api/auth/me
+ * Returns the currently authenticated user's identity.
+ * Used by AuthContext on mount to verify the server-side session and hydrate the client.
+ */
 export async function GET(request: NextRequest) {
   try {
-    const accessToken = request.cookies.get(AUTH_COOKIE_NAMES.ACCESS_TOKEN)?.value
-    const sessionMeta = request.cookies.get(AUTH_COOKIE_NAMES.SESSION_META)?.value
-
-    if (!accessToken && !sessionMeta) {
-      return NextResponse.json({ authenticated: false }, { status: 401 })
+    const guard = await requireAuth(request);
+    if (!guard.ok) {
+      return NextResponse.json({ user: null }, { status: 200 });
     }
 
-    // Try parsing fast session metadata cookie
-    if (sessionMeta) {
-      try {
-        const user = JSON.parse(sessionMeta)
-        return NextResponse.json({
-          authenticated: true,
-          user,
-        })
-      } catch {
-        // Fallback to token lookup
-      }
-    }
+    const { auth } = guard;
+    const profile = await resolveUserProfile(auth.sub, auth.userType);
 
-    // Verify token with Cognito if needed
-    if (accessToken) {
-      const user = await getCognitoUser(accessToken)
-      if (user) {
-        return NextResponse.json({
-          authenticated: true,
-          user: {
-            id: user.sub,
-            email: user.email,
-            name: user.name,
-            userType: user.userType,
-          },
-        })
-      }
-    }
-
-    return NextResponse.json({ authenticated: false }, { status: 401 })
+    return NextResponse.json({ user: profile });
   } catch (error) {
-    return NextResponse.json({ authenticated: false }, { status: 401 })
+    console.error('[Auth/Me] Error:', error);
+    return NextResponse.json({ user: null }, { status: 200 });
   }
 }

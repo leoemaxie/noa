@@ -1,45 +1,78 @@
-'use client'
+import * as React from 'react';
+import Link from 'next/link';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Bell, LogOut } from 'lucide-react';
+import { requireServerAuth } from '@/lib/auth/server';
+import { getPatientById } from '@/lib/db';
+import { PatientRefreshButton } from '@/components/patient';
 
-import * as React from 'react'
-import Link from 'next/link'
-import { Badge } from '@/components/ui/badge'
-import { Bell, LogOut } from 'lucide-react'
-
-export default function PatientDashboardLayout({
+export default async function PatientDashboardLayout({
   children,
 }: {
-  children: React.ReactNode
+  children: React.ReactNode;
 }) {
+  const auth = await requireServerAuth(['patient']);
+  const patient = await getPatientById(auth.sub);
+  const initial = patient?.firstName
+    ? patient.firstName.charAt(0).toUpperCase()
+    : 'P';
+
   return (
-    <div className="min-h-screen bg-canvas text-deep-ink flex flex-col">
+    <div className="bg-canvas text-deep-ink flex min-h-screen flex-col">
       {/* Patient Portal Header */}
-      <header className="border-b border-deep-ink/8 bg-canvas/90 backdrop-blur-md sticky top-0 z-20 font-sans">
-        <div className="mx-auto max-w-5xl px-4 sm:px-6 py-3.5 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-3 min-w-0">
-            <Link href="/dashboard/patient" className="flex items-center gap-2.5 hover:opacity-90 transition-opacity shrink-0">
-              <img src="/logo.svg" alt="Noa Logo" className="w-8 h-8 rounded-lg shadow-2xs" />
-              <span className="text-xl font-bold font-serif text-deep-ink">Noa</span>
+      <header className="border-deep-ink/8 bg-canvas/90 sticky top-0 z-20 border-b font-sans backdrop-blur-md">
+        <div className="flex w-full items-center justify-between gap-2 px-4 py-3.5 sm:px-6 lg:px-8">
+          <div className="flex min-w-0 items-center gap-3">
+            <Link
+              href="/dashboard/patient"
+              className="flex shrink-0 items-center gap-2.5 transition-opacity hover:opacity-90"
+            >
+              <img
+                src="/logo.svg"
+                alt="Noa Logo"
+                className="h-8 w-8 rounded-lg shadow-2xs"
+              />
+              <span className="text-deep-ink font-serif text-xl font-bold">
+                Noa
+              </span>
             </Link>
-            <Badge variant="secondary" className="hidden sm:inline-flex text-[11px] shrink-0">
+            <Badge
+              variant="secondary"
+              className="hidden shrink-0 text-[11px] sm:inline-flex"
+            >
               Patient Portal
             </Badge>
           </div>
-          <div className="flex items-center gap-2.5 sm:gap-4 shrink-0">
-            <button
-              className="p-1.5 hover:bg-soft-meadow rounded-lg text-slate hover:text-deep-ink transition-colors cursor-pointer"
+          <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
+            <PatientRefreshButton />
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="hover:bg-soft-meadow text-slate hover:text-deep-ink cursor-pointer transition-colors"
               aria-label="Notifications"
             >
-              <Bell className="w-4 h-4" />
-            </button>
-            <div className="w-8 h-8 rounded-lg bg-hi-yellow border border-deep-ink/10 flex items-center justify-center font-serif font-bold text-deep-ink shadow-2xs text-xs">
-              P
+              <Bell className="h-4 w-4" />
+            </Button>
+            <div className="border-deep-ink/10 flex h-8 w-8 items-center justify-center overflow-hidden rounded-lg border shadow-2xs">
+              {patient?.avatar ? (
+                <img
+                  src={patient.avatar}
+                  alt={patient.firstName || 'Patient'}
+                  className="h-full w-full object-cover"
+                />
+              ) : (
+                <div className="bg-hi-yellow text-deep-ink flex h-full w-full items-center justify-center font-serif text-xs font-bold">
+                  {initial}
+                </div>
+              )}
             </div>
             <Link
               href="/auth/logout"
-              className="text-xs font-medium text-slate hover:text-deep-ink flex items-center gap-1.5 transition-colors p-1"
+              className="text-slate hover:text-deep-ink flex items-center gap-1.5 p-1 text-xs font-medium transition-colors"
               aria-label="Log Out"
             >
-              <LogOut className="w-3.5 h-3.5" />
+              <LogOut className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Log Out</span>
             </Link>
           </div>
@@ -47,9 +80,7 @@ export default function PatientDashboardLayout({
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1">
-        {children}
-      </main>
+      <main className="flex-1">{children}</main>
     </div>
-  )
+  );
 }

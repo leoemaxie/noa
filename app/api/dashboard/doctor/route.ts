@@ -1,58 +1,92 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server';
 
-import type { ApiSuccess } from '@/lib/types/api.types'
-import type { DoctorDashboardPayload } from '@/lib/types/doctor.types'
-import { getDoctorById, getPatientsByDoctor, getSessionsByDoctor } from '@/lib/db'
+import type { ApiSuccess } from '@/lib/types/api.types';
+import type { DoctorDashboardPayload } from '@/lib/types/doctor.types';
+import { getDoctorById } from '@/lib/db';
+import { getDoctorData } from '@/lib/data/doctor';
+import { requireAuth } from '@/lib/auth/guard';
 
 export async function GET(request: NextRequest) {
   try {
-    const doctorId = request.nextUrl.searchParams.get('doctorId')
+    const guard = await requireAuth(request, ['doctor', 'admin']);
+    if (!guard.ok) return guard.response;
+    const { auth } = guard;
 
-    if (!doctorId) {
-      return NextResponse.json({ message: 'doctorId is required' }, { status: 400 })
+    // Canonical doctor ID is the Cognito Auth ID
+    const requestedDoctorId = request.nextUrl.searchParams.get('doctorId');
+    const canonicalDoctorId = auth.sub;
+
+    let doctorId = canonicalDoctorId;
+    if (auth.userType === 'admin' && requestedDoctorId) {
+      doctorId = requestedDoctorId;
     }
 
-    const [doctor, patients, sessions] = await Promise.all([
-      getDoctorById(doctorId),
-      getPatientsByDoctor(doctorId),
-      getSessionsByDoctor(doctorId),
-    ])
+    if (
+      auth.userType === 'doctor' &&
+      requestedDoctorId &&
+      requestedDoctorId !== canonicalDoctorId
+    ) {
+      return NextResponse.json(
+        { message: 'Forbidden: Cannot access another doctor dashboard' },
+        { status: 403 }
+      );
+    }
 
+    const doctor = await getDoctorById(doctorId);
     if (!doctor) {
-      return NextResponse.json({ message: 'Doctor not found' }, { status: 404 })
+      return NextResponse.json(
+        { message: 'Doctor not found' },
+        { status: 404 }
+      );
     }
 
-    const today = new Date()
-    const stats = {
-      totalPatients: patients.length,
-      totalSessions: sessions.length,
-      completedSessions: sessions.filter(session => session.status === 'completed').length,
-      activeSessions: sessions.filter(session => session.status === 'active').length,
-      pendingNotes: sessions.filter(session => session.status === 'active' && !session.soapNote).length,
-      todaySessions: sessions.filter(session => new Date(session.startedAt).toDateString() === today.toDateString()).length,
+    // Enforce credential verification: pending or rejected accounts cannot access clinical dashboard
+    if (doctor.verificationStatus === 'pending') {
+      return NextResponse.json(
+        {
+          message:
+            'Your medical credentials are currently under review by clinical administration.',
+          verificationStatus: 'pending',
+          doctor,
+        },
+        { status: 403 }
+      );
     }
 
-    const dashboard: DoctorDashboardPayload = {
-      doctor,
-      patients,
-      sessions: [...sessions].sort((a, b) => b.startedAt - a.startedAt),
-      stats,
+    if (doctor.verificationStatus === 'rejected') {
+      return NextResponse.json(
+        {
+          message: 'Your medical verification request was rejected.',
+          verificationStatus: 'rejected',
+          rejectionReason: doctor.rejectionReason,
+          doctor,
+        },
+        { status: 403 }
+      );
+    }
+
+    const dashboard = await getDoctorData(doctorId);
+    if (!dashboard) {
+      return NextResponse.json(
+        { message: 'Doctor dashboard data not found' },
+        { status: 404 }
+      );
     }
 
     const response: ApiSuccess<DoctorDashboardPayload> = {
       success: true,
       data: dashboard,
-    }
+    };
 
-    return NextResponse.json(response)
+    return NextResponse.json(response);
   } catch (error) {
-    console.error('[v0] Error loading doctor dashboard:', error)
+    console.error('[Dashboard/Doctor] Error loading doctor dashboard:', error);
     return NextResponse.json(
       {
         message: 'Failed to load doctor dashboard',
         error: error instanceof Error ? error.message : 'Unknown error',
       },
       { status: 500 }
-    )
+    );
   }
 }

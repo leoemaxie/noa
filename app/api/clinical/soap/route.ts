@@ -1,34 +1,37 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { generateSOAPWithNova } from '@/lib/bedrock-nova'
-import { updateSession } from '@/lib/db'
-import { checkRateLimit, getClientIdentifier, rateLimitResponse } from '@/lib/ratelimit'
-import { ClinicalAIUnavailableError } from '@/lib/ai/provider'
+import { NextRequest } from 'next/server';
+import { generateSOAPWithNova } from '@/lib/bedrock';
+import { updateSession } from '@/lib/db';
+import { requireAuth } from '@/lib/auth/guard';
+import { soapGenerateSchema } from '@/lib/validations';
+import {
+  apiSuccess,
+  handleApiError,
+  zodValidationError,
+} from '@/lib/api/response';
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { transcript, patientInfo, sessionId, patientId } = body
+    const guard = await requireAuth(request, undefined, {
+      prefix: 'soap',
+      limit: 20,
+      windowSeconds: 60,
+    });
+    if (!guard.ok) return guard.response;
+    const { auth } = guard;
 
-    if (!transcript) {
-      return NextResponse.json(
-        { error: 'Transcript is required' },
-        { status: 400 }
-      )
+    const rawBody = await request.json().catch(() => ({}));
+    const parseResult = soapGenerateSchema.safeParse(rawBody);
+
+    if (!parseResult.success) {
+      return zodValidationError(parseResult.error, 'Transcript is required');
     }
 
-    // Rate limiting: max 20 requests per minute per client
-    const clientId = getClientIdentifier(request, patientId)
-    const rateCheck = await checkRateLimit(clientId, { limit: 20, windowSeconds: 60 })
-    if (!rateCheck.success) {
-      return rateLimitResponse(rateCheck)
-    }
+    const { transcript, patientInfo, sessionId } = parseResult.data;
 
-    console.log('[v0] Generating SOAP note with Nova AI')
+    console.log('[SOAP] Generating SOAP note with Nova AI for user:', auth.sub);
 
-    // Generate SOAP note using Nova Lite via Bedrock
-    const soapNote = await generateSOAPWithNova(transcript, patientInfo || '')
+    const soapNote = await generateSOAPWithNova(transcript, patientInfo || '');
 
-    // If sessionId provided, update session in DynamoDB
     if (sessionId) {
       try {
         await updateSession(sessionId, {
@@ -41,29 +44,15 @@ export async function POST(request: NextRequest) {
           },
           transcript,
           status: 'completed',
-        })
+        });
       } catch (dbError) {
-        console.error('[v0] Error updating session in DB:', dbError)
-        // Continue even if DB update fails - SOAP note still generated
+        console.error('[SOAP] Error updating session in DB:', dbError);
+        // SOAP note still returned to client even if DB update fails
       }
     }
 
-    return NextResponse.json({
-      success: true,
-      soapNote,
-      sessionId,
-    })
+    return apiSuccess({ soapNote, sessionId });
   } catch (error) {
-    console.error('[v0] Error generating SOAP note:', error)
-    if (error instanceof ClinicalAIUnavailableError && error.isThrottling) {
-      return NextResponse.json(
-        { error: 'Too Many Requests', message: 'AWS Bedrock model capacity exceeded. Please retry in a few moments.' },
-        { status: 429, headers: { 'Retry-After': '5' } }
-      )
-    }
-    return NextResponse.json(
-      { error: 'Failed to generate SOAP note', message: error instanceof Error ? error.message : 'Unknown error' },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to generate SOAP note');
   }
 }

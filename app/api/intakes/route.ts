@@ -1,22 +1,68 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { createIntake, getIntakesByPatient } from '@/lib/db'
+import { NextRequest } from 'next/server';
+import { createIntake, getIntakesByPatient } from '@/lib/db';
+import { getAuthenticatedUser } from '@/lib/auth/jwt';
+import { requireAuth } from '@/lib/auth/guard';
+import { intakeSubmitSchema } from '@/lib/validations';
+import {
+  apiError,
+  apiSuccess,
+  handleApiError,
+  zodValidationError,
+} from '@/lib/api/response';
+import { API_ERROR_CODES } from '@/lib/types/api.types';
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { patientId, doctorId, medicalHistory, medications, allergies, surgeries, familyHistory, socialHistory } = body
+    const auth = await getAuthenticatedUser(request);
 
-    if (!patientId || !doctorId) {
-      return NextResponse.json(
-        { error: 'patientId and doctorId are required' },
-        { status: 400 }
-      )
+    const rawBody = await request.json().catch(() => ({}));
+    const parseResult = intakeSubmitSchema.safeParse(rawBody);
+
+    if (!parseResult.success) {
+      return zodValidationError(
+        parseResult.error,
+        'Intake submission validation failed'
+      );
+    }
+
+    const {
+      patientId: requestedPatientId,
+      doctorId,
+      chiefComplaint,
+      summary,
+      medicalHistory,
+      medications,
+      allergies,
+      surgeries,
+      familyHistory,
+      socialHistory,
+    } = parseResult.data;
+
+    const patientId =
+      auth.isValid && auth.userType === 'patient' && auth.sub
+        ? auth.sub
+        : requestedPatientId ||
+          `guest-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    if (
+      auth.isValid &&
+      auth.userType === 'patient' &&
+      requestedPatientId &&
+      requestedPatientId !== auth.sub
+    ) {
+      return apiError(
+        API_ERROR_CODES.FORBIDDEN,
+        'Forbidden: Cannot submit intake for another patient',
+        403
+      );
     }
 
     // Create intake in DynamoDB
     const intake = await createIntake({
       patientId,
       doctorId,
+      chiefComplaint: chiefComplaint || summary || '',
+      summary: summary || chiefComplaint || '',
       medicalHistory: medicalHistory || '',
       medications: medications || [],
       allergies: allergies || [],
@@ -25,44 +71,45 @@ export async function POST(request: NextRequest) {
       socialHistory: socialHistory || '',
       completed: true,
       completedAt: Date.now(),
-    })
+    });
 
-    return NextResponse.json({
-      success: true,
+    return apiSuccess({
       intake,
       message: 'Intake form submitted successfully',
-    })
+    });
   } catch (error) {
-    console.error('[v0] Error saving intake:', error)
-    return NextResponse.json(
-      { error: 'Failed to submit intake form', message: error instanceof Error ? error.message : 'Unknown error' },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to submit intake form');
   }
 }
 
 export async function GET(request: NextRequest) {
   try {
-    const patientId = request.nextUrl.searchParams.get('patientId')
+    const guard = await requireAuth(request);
+    if (!guard.ok) return guard.response;
+    const { auth } = guard;
+
+    const patientId = request.nextUrl.searchParams.get('patientId');
 
     if (!patientId) {
-      return NextResponse.json(
-        { error: 'patientId is required' },
-        { status: 400 }
-      )
+      return apiError(
+        API_ERROR_CODES.BAD_REQUEST,
+        'patientId is required',
+        400
+      );
     }
 
-    const intakes = await getIntakesByPatient(patientId)
+    if (auth.userType === 'patient' && patientId !== auth.sub) {
+      return apiError(
+        API_ERROR_CODES.FORBIDDEN,
+        'Forbidden: Cannot view another patient intake',
+        403
+      );
+    }
 
-    return NextResponse.json({
-      success: true,
-      intakes,
-    })
+    const intakes = await getIntakesByPatient(patientId);
+
+    return apiSuccess({ intakes });
   } catch (error) {
-    console.error('[v0] Error fetching intakes:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch intakes', message: error instanceof Error ? error.message : 'Unknown error' },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to fetch intakes');
   }
 }

@@ -1,61 +1,205 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { processVoiceInput, generateRealTimeNotes } from '@/lib/voice-service'
-import { updateSession } from '@/lib/db'
+import { NextRequest } from 'next/server';
+import {
+  processVoiceInput,
+  generateRealTimeNotes,
+  transcribeAudio,
+  getClinicaSuggestions,
+} from '@/lib/voice-service';
+import {
+  getSessionById,
+  createSession,
+  updateSession,
+  isDoctorVerified,
+} from '@/lib/db';
+import { requireAuth } from '@/lib/auth/guard';
+import { apiError, apiSuccess, handleApiError } from '@/lib/api/response';
+import { API_ERROR_CODES } from '@/lib/types/api.types';
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { sessionId, userTranscript, sessionContext, patientInfo, transcript } = body
+    const guard = await requireAuth(request, ['doctor'], {
+      prefix: 'voice',
+      limit: 30,
+      windowSeconds: 60,
+    });
+    if (!guard.ok) return guard.response;
+    const { auth } = guard;
 
-    if (!sessionId) {
-      return NextResponse.json(
-        { error: 'Session ID is required' },
-        { status: 400 }
-      )
-    }
-
-    console.log('[v0] Processing voice input for session:', sessionId)
-
-    let response = ''
-    
-    // Process voice input with Sonic for real-time conversation
-    if (userTranscript && sessionContext) {
-      response = await processVoiceInput(userTranscript, sessionContext, patientInfo)
-    }
-
-    // Generate real-time notes when transcript is provided
-    let realTimeNotes = null
-    if (transcript) {
-      realTimeNotes = await generateRealTimeNotes(
-        transcript,
-        sessionContext || { sessionId, transcript: [], clientIds: [], isRecording: true, doctorId: '', patientId: '' }
-      )
-
-      // Update session with real-time notes
-      try {
-        await updateSession(sessionId, {
-          realTimeNotes,
-          transcript,
-        })
-      } catch (error) {
-        console.error('[v0] Error updating session notes:', error)
+    if (auth.userType === 'doctor') {
+      const verified = await isDoctorVerified(auth.sub);
+      if (!verified) {
+        return apiError(
+          API_ERROR_CODES.ACCOUNT_UNVERIFIED,
+          'Forbidden: Your medical license is pending review. Voice consultation is locked until verified.',
+          403
+        );
       }
     }
 
-    return NextResponse.json({
-      success: true,
-      aiResponse: response,
-      realTimeNotes,
+    const contentType = request.headers.get('content-type') || '';
+    let sessionId = '';
+    let doctorId = '';
+    let patientId = '';
+    let chunkIndex = 0;
+    let audioBuffer: Buffer | null = null;
+    let clientTranscript = '';
+    let userTranscript = '';
+    let sessionContext: Record<string, unknown> | null = null;
+    let patientInfo = '';
+    let legacyTranscript = '';
+
+    if (contentType.includes('multipart/form-data')) {
+      const formData = await request.formData();
+      sessionId = (formData.get('sessionId') as string) || '';
+      doctorId = (formData.get('doctorId') as string) || '';
+      patientId = (formData.get('patientId') as string) || '';
+      chunkIndex = parseInt((formData.get('chunkIndex') as string) || '0', 10);
+      // Do NOT accept clientTranscript from multipart — server-side transcription only
+      const audioFile = formData.get('audio') as File | null;
+      if (audioFile) {
+        const arrayBuffer = await audioFile.arrayBuffer();
+        audioBuffer = Buffer.from(arrayBuffer);
+      }
+    } else {
+      const body = await request.json();
+      sessionId = body.sessionId || '';
+      doctorId = body.doctorId || '';
+      patientId = body.patientId || '';
+      chunkIndex = body.chunkIndex || 0;
+      userTranscript = body.userTranscript || '';
+      sessionContext = body.sessionContext || null;
+      patientInfo = body.patientInfo || '';
+      legacyTranscript = body.transcript || '';
+
+      if (body.audioBase64) {
+        audioBuffer = Buffer.from(body.audioBase64, 'base64');
+      }
+    }
+
+    if (!sessionId) {
+      return apiError(
+        API_ERROR_CODES.VALIDATION_ERROR,
+        'Session ID is required',
+        400
+      );
+    }
+
+    // Enforce that doctorId and patientId must be provided
+    if (!doctorId || !patientId) {
+      return apiError(
+        API_ERROR_CODES.VALIDATION_ERROR,
+        'doctorId and patientId are required',
+        400
+      );
+    }
+
+    // BOLA: verify the calling doctor owns this session's doctorId
+    if (auth.userType === 'doctor' && doctorId !== auth.sub) {
+      return apiError(
+        API_ERROR_CODES.FORBIDDEN,
+        "Forbidden: Cannot submit voice for another doctor's session",
+        403
+      );
+    }
+
+    // 1. Process legacy voice input if present
+    let aiResponse = '';
+    if (userTranscript && sessionContext) {
+      aiResponse = await processVoiceInput(
+        userTranscript,
+        sessionContext as never,
+        patientInfo
+      );
+    }
+
+    // 2. Transcribe incoming audio chunk via Bedrock.
+    //    Client-supplied transcripts are NOT accepted as fallback to prevent injection.
+    let chunkTranscript = '';
+    if (audioBuffer && audioBuffer.length > 0) {
+      try {
+        chunkTranscript = await transcribeAudio(
+          audioBuffer,
+          `${sessionId}-chunk-${chunkIndex}`
+        );
+      } catch (err) {
+        console.warn(`[Voice] Chunk ${chunkIndex} transcription failed:`, err);
+        // Do not fall back to client transcript — return partial success instead
+      }
+    } else if (legacyTranscript) {
+      // Accept server-side legacy transcript field only (not client-side bypass)
+      chunkTranscript = legacyTranscript;
+    }
+
+    // 3. Atomically update session in DynamoDB
+    let fullTranscript = '';
+    let suggestions: string[] = [];
+    let realTimeNotes = null;
+
+    const session = await getSessionById(sessionId);
+
+    if (chunkTranscript.trim()) {
+      if (session) {
+        fullTranscript = session.transcript
+          ? `${session.transcript}\n${chunkTranscript.trim()}`
+          : chunkTranscript.trim();
+        await updateSession(sessionId, { transcript: fullTranscript });
+      } else {
+        fullTranscript = chunkTranscript.trim();
+        await createSession({
+          id: sessionId,
+          doctorId,
+          patientId,
+          startedAt: Date.now(),
+          status: 'active',
+          transcript: fullTranscript,
+        });
+      }
+
+      // Generate clinical suggestions only for meaningful chunk sizes (100+ chars)
+      if (chunkTranscript.length > 100) {
+        try {
+          suggestions = await getClinicaSuggestions(chunkTranscript, '', '');
+        } catch (suggErr) {
+          console.warn('[Voice] Suggestions generation warning:', suggErr);
+          suggestions = [];
+        }
+      }
+    } else {
+      fullTranscript = session?.transcript || '';
+    }
+
+    // 4. Generate real-time notes if legacy transcript is provided
+    if (legacyTranscript) {
+      try {
+        realTimeNotes = await generateRealTimeNotes(
+          legacyTranscript,
+          (sessionContext as never) || {
+            sessionId,
+            transcript: [],
+            isRecording: true,
+            doctorId,
+            patientId,
+          }
+        );
+        await updateSession(sessionId, {
+          realTimeNotes,
+          transcript: fullTranscript,
+        });
+      } catch (noteErr) {
+        console.warn('[Voice] Error generating real-time notes:', noteErr);
+      }
+    }
+
+    return apiSuccess({
       sessionId,
-    })
+      chunkIndex,
+      chunkTranscript,
+      fullTranscript,
+      suggestions,
+      aiResponse,
+      realTimeNotes,
+    });
   } catch (error) {
-    console.error('[v0] Error processing voice input:', error)
-    return NextResponse.json(
-      {
-        error: 'Failed to process voice input',
-        message: error instanceof Error ? error.message : 'Unknown error',
-      },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to process voice session');
   }
 }

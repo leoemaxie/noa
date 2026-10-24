@@ -1,65 +1,70 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { generateClinicalInsights, generateFollowUpPlan } from '@/lib/bedrock-nova'
-import { checkRateLimit, getClientIdentifier, rateLimitResponse } from '@/lib/ratelimit'
-import { ClinicalAIUnavailableError } from '@/lib/ai/provider'
+import { NextRequest } from 'next/server';
+import { generateClinicalInsights, generateFollowUpPlan } from '@/lib/bedrock';
+import { requireAuth } from '@/lib/auth/guard';
+import { insightsGenerateSchema } from '@/lib/validations';
+import {
+  apiSuccess,
+  handleApiError,
+  zodValidationError,
+} from '@/lib/api/response';
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { patientHistory, currentPresentation, previousFindings, medications, procedures } = body
+    const guard = await requireAuth(request, undefined, {
+      prefix: 'insights',
+      limit: 20,
+      windowSeconds: 60,
+    });
+    if (!guard.ok) return guard.response;
+    const { auth } = guard;
 
-    if (!currentPresentation) {
-      return NextResponse.json(
-        { error: 'Current presentation is required' },
-        { status: 400 }
-      )
+    const rawBody = await request.json().catch(() => ({}));
+    const parseResult = insightsGenerateSchema.safeParse(rawBody);
+
+    if (!parseResult.success) {
+      return zodValidationError(
+        parseResult.error,
+        'Current presentation is required'
+      );
     }
 
-    // Rate limiting: max 20 requests per minute per client
-    const clientId = getClientIdentifier(request)
-    const rateCheck = await checkRateLimit(clientId, { limit: 20, windowSeconds: 60 })
-    if (!rateCheck.success) {
-      return rateLimitResponse(rateCheck)
-    }
+    const {
+      patientHistory,
+      currentPresentation,
+      previousFindings,
+      medications,
+      procedures,
+    } = parseResult.data;
 
-    console.log('[v0] Generating clinical insights with Nova')
+    console.log('[v0] Generating clinical insights with Nova');
 
     // Generate clinical insights using Nova Pro
     const insights = await generateClinicalInsights(
       patientHistory || '',
       currentPresentation,
       previousFindings || ''
-    )
+    );
 
     // Generate follow-up plan if medications or procedures provided
-    let followUpPlan = ''
+    let followUpPlan = '';
     if (medications || procedures) {
+      const proceduresList = procedures
+        ? Array.isArray(procedures)
+          ? procedures
+          : [procedures]
+        : undefined;
       followUpPlan = await generateFollowUpPlan(
         currentPresentation,
         medications || [],
-        procedures
-      )
+        proceduresList
+      );
     }
 
-    return NextResponse.json({
-      success: true,
+    return apiSuccess({
       insights,
       followUpPlan,
-    })
+    });
   } catch (error) {
-    console.error('[v0] Error generating clinical insights:', error)
-    if (error instanceof ClinicalAIUnavailableError && error.isThrottling) {
-      return NextResponse.json(
-        { error: 'Too Many Requests', message: 'AWS Bedrock model capacity exceeded. Please retry in a few moments.' },
-        { status: 429, headers: { 'Retry-After': '5' } }
-      )
-    }
-    return NextResponse.json(
-      {
-        error: 'Failed to generate clinical insights',
-        message: error instanceof Error ? error.message : 'Unknown error',
-      },
-      { status: 500 }
-    )
+    return handleApiError(error, 'Failed to generate clinical insights');
   }
 }

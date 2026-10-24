@@ -1,49 +1,67 @@
 # System Architecture & Data Model
 
-Comprehensive reference for Noa's application architecture, AWS Bedrock AI integration, DynamoDB single-table design, and real-time voice consultation pipeline.
+Comprehensive reference for Noa's application architecture, Hybrid Tri-Model AI integration, DynamoDB single-table design, and real-time voice pipelines.
 
 ---
 
 ## 1. High-Level Architecture
 
-Noa is a Next.js (App Router) healthcare platform that combines generative AI clinical assistance, real-time voice streaming, and encrypted cloud storage.
+Noa is a Next.js (App Router) healthcare platform implementing the **Hybrid Tri-Model Architecture** — three purpose-built AI models working in concert across three distinct clinical workflows.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Next.js Application                      │
-│        Doctor Dashboard · Patient Intake · Consultation UI  │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-       ┌───────────────────────┼───────────────────────┐
-       │                       │                       │
-┌──────▼──────┐         ┌──────▼──────┐         ┌──────▼──────┐
-│ AWS Bedrock │         │AWS DynamoDB │         │   AWS S3    │
-│  Nova/Sonic │         │ Single-Table│         │ Audio Store │
-└─────────────┘         └─────────────┘         └─────────────┘
+                                NOA CLINICAL PLATFORM
+                                         │
+         ┌───────────────────────────────┴──────────────────────────────┐
+         ▼                                                              ▼
+PATIENT INTAKE (2–5 min)                               AMBIENT CONSULTATION (15–45+ min)
+[Interactive Speech-to-Speech]                           [Passive Clinical Scribing]
+         │                                                              │
+Browser AudioWorklet (16kHz PCM)                    Browser MediaRecorder (60s slices)
+         │                                                              │
+Vercel WebSocket (experimental_upgradeWebSocket)     S3 Presigned PUT (direct upload)
+         │                                                              │
+Bedrock InvokeModelWithBidirectionalStream           Amazon Transcribe Medical
+         │                                                              │
+Amazon Nova 2 Sonic (Human voice dialogue)          DynamoDB Transcript Stream
+         │                                                              │
+         └───────────────────────────────┬──────────────────────────────┘
+                                         ▼
+                             CLINICAL INTELLIGENCE
+                    ┌────────────────────┬──────────────────────┐
+                    ▼                    ▼                      ▼
+              FAST TIER           REASONING TIER           POST-VISIT
+          Nova 2 Lite             Nova Pro             SOAP Synthesis
+       Real-time suggestions  Differential diagnosis  Nova Pro async
+       Intake field extraction  ICD-10 coding         Full SOAP note
 ```
 
-- **Frontend**: Next.js 16, React 19, Tailwind CSS, Lucide icons, Zustand state stores.
-- **Real-Time Voice**: WebSocket server (`lib/websocket-service.ts`) streaming audio during live consultations.
-- **Clinical AI Engine**: AWS Bedrock Runtime client (`lib/bedrock-nova.ts`) generating SOAP notes, triage priority, and diagnostic insights.
-- **Persistence**: AWS DynamoDB single-table design (`lib/db.ts`) with on-demand capacity.
-- **Media Storage**: AWS S3 bucket with AES-256 encryption and lifecycle archiving.
-- **Extensibility**: Native Model Context Protocol server and in-browser integration (`docs/webmcp.md`).
+### Component Summary
+
+| Layer                    | Technology                                  | Purpose                                                   |
+| :----------------------- | :------------------------------------------ | :-------------------------------------------------------- |
+| **Frontend**             | Next.js 16, React 19, Tailwind CSS, Zustand | Doctor dashboard, patient intake UI, consultation monitor |
+| **Patient Intake Voice** | Vercel WebSocket + Nova 2 Sonic             | Real-time speech-to-speech interactive intake dialogue    |
+| **Consultation Scribe**  | MediaRecorder + S3 + Transcribe Medical     | Unlimited-duration ambient clinical transcription         |
+| **Real-time AI**         | Nova 2 Lite (Converse API)                  | Live suggestions, field extraction, structured JSON       |
+| **Clinical Reasoning**   | Nova Pro (Converse API)                     | Deep SOAP synthesis, differential diagnosis, ICD-10       |
+| **Persistence**          | AWS DynamoDB single-table                   | Sessions, patients, SOAP notes, transcript segments       |
+| **Media Storage**        | AWS S3 + presigned URLs                     | Audio slices, reports, backups (AES-256 encrypted)        |
+| **Extensibility**        | WebMCP (in-browser Model Context Protocol)  | AI tool integration and clinical resource access          |
 
 ---
 
-## 2. AWS Bedrock AI Integration
+## 2. Hybrid Tri-Model AI Engine
 
-Noa interfaces with AWS Bedrock via `@aws-sdk/client-bedrock-runtime` (`lib/aws-config.ts` and `lib/bedrock-nova.ts`).
+Noa interfaces with AWS Bedrock via `@aws-sdk/client-bedrock-runtime` (`lib/aws-config.ts`, `lib/ai/provider.ts`).
 
 ### Model Roles
 
-| Role | Bedrock Model | Purpose | Location |
-|---|---|---|---|
+| ----------------- | ----------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------- |
 | **Nova Lite** | `amazon.nova-lite-v2:0` | Low-latency clinical documentation: SOAP notes, patient-friendly summaries, triage assessments | `lib/bedrock-nova.ts` |
 | **Nova Pro** | `amazon.nova-pro-v2:0` | Deep clinical intelligence: differential diagnoses, complex case recommendations, pattern recognition | `lib/bedrock-nova.ts` |
 | **Sonic / Voice** | `amazon.nova-lite-v2:0` | Real-time consultation suggestions, live transcript evaluation, sentiment analysis | `lib/voice-service.ts` |
 
-*(Fallback model IDs such as `us.anthropic.claude-3-5-sonnet-20241022` can be configured via environment variables if desired.)*
+_(Fallback model IDs such as `us.anthropic.claude-3-5-sonnet-20241022` can be configured via environment variables if desired.)_
 
 ### Core AI Capabilities
 
@@ -71,94 +89,98 @@ Noa uses a single-table architecture named `noa-data` (configurable via `DYNAMOD
 
 All GSIs use `KEYS_ONLY` projection in Terraform for minimal storage overhead and cost:
 
-| Index Name | Hash Key | Range Key | Access Pattern |
-|---|---|---|---|
-| **`email-index`** | `email` (S) | `type` (S) | Find doctor or patient account by email address |
-| **`doctorId-index`** | `doctorId` (S) | `type` (S) | Query all patients or sessions belonging to a specific doctor |
+| Index Name            | Hash Key        | Range Key  | Access Pattern                                                |
+| --------------------- | --------------- | ---------- | ------------------------------------------------------------- |
+| **`email-index`**     | `email` (S)     | `type` (S) | Find doctor or patient account by email address               |
+| **`doctorId-index`**  | `doctorId` (S)  | `type` (S) | Query all patients or sessions belonging to a specific doctor |
 | **`patientId-index`** | `patientId` (S) | `type` (S) | Query all consultation sessions or intake forms for a patient |
 
 ### Entity Definitions
 
 #### 1. Doctor (`type: 'doctor'`)
+
 ```typescript
 interface Doctor {
-  id: string              // "doctor-{nanoid}"
-  type: 'doctor'
-  email: string           // Indexed via email-index
-  name: string
-  specialty: string
-  license: string
-  clinic: string
-  phone?: string
-  avatar?: string
-  createdAt: number
-  updatedAt: number
+  id: string; // "doctor-{nanoid}"
+  type: 'doctor';
+  email: string; // Indexed via email-index
+  name: string;
+  specialty: string;
+  license: string;
+  clinic: string;
+  phone?: string;
+  avatar?: string;
+  createdAt: number;
+  updatedAt: number;
 }
 ```
 
 #### 2. Patient (`type: 'patient'`)
+
 ```typescript
 interface Patient {
-  id: string              // "patient-{nanoid}"
-  type: 'patient'
-  doctorId: string        // Indexed via doctorId-index
-  email: string           // Indexed via email-index
-  firstName: string
-  lastName: string
-  dateOfBirth?: string
-  gender?: string
-  phone?: string
-  address?: string
-  allergies?: string[]
-  medications?: string[]
-  conditions?: string[]
-  avatar?: string
-  createdAt: number
-  updatedAt: number
+  id: string; // "patient-{nanoid}"
+  type: 'patient';
+  doctorId: string; // Indexed via doctorId-index
+  email: string; // Indexed via email-index
+  firstName: string;
+  lastName: string;
+  dateOfBirth?: string;
+  gender?: string;
+  phone?: string;
+  address?: string;
+  allergies?: string[];
+  medications?: string[];
+  conditions?: string[];
+  avatar?: string;
+  createdAt: number;
+  updatedAt: number;
 }
 ```
 
 #### 3. Session (`type: 'session'`)
+
 ```typescript
 interface Session {
-  id: string              // "session-{nanoid}"
-  type: 'session'
-  doctorId: string        // Indexed via doctorId-index
-  patientId: string       // Indexed via patientId-index
-  startedAt: number
-  endedAt?: number
-  transcript?: string
-  audioUrl?: string
-  status: 'active' | 'completed' | 'archived'
+  id: string; // "session-{nanoid}"
+  type: 'session';
+  doctorId: string; // Indexed via doctorId-index
+  patientId: string; // Indexed via patientId-index
+  startedAt: number;
+  endedAt?: number;
+  transcript?: string;
+  audioUrl?: string;
+  status: 'active' | 'completed' | 'archived';
   soapNote?: {
-    subjective: string
-    objective: string
-    assessment: string
-    plan: string
-    generatedAt: number
-  }
-  createdAt: number
-  updatedAt: number
+    subjective: string;
+    objective: string;
+    assessment: string;
+    plan: string;
+    generatedAt: number;
+  };
+  createdAt: number;
+  updatedAt: number;
 }
 ```
 
 #### 4. Patient Intake (`type: 'intake'`)
+
 ```typescript
 interface PatientIntake {
-  id: string              // "intake-{nanoid}"
-  type: 'intake'
-  patientId: string       // Indexed via patientId-index
-  doctorId: string
-  medicalHistory: string
-  medications: string[]
-  allergies: string[]
-  surgeries?: string
-  familyHistory?: string
-  socialHistory?: string
-  completed: boolean
-  completedAt?: number
-  createdAt: number
-  updatedAt: number
+  id: string; // "intake-{nanoid}"
+  type: 'intake';
+  patientId: string; // Indexed via patientId-index
+  doctorId: string;
+  medicalHistory: string;
+  medications: string[];
+  allergies: string[];
+  surgeries?: string;
+  familyHistory?: string;
+  socialHistory?: string;
+  completed: boolean;
+  completedAt?: number;
+  createdAt: number;
+  updatedAt: number;
 }
 ```
 
@@ -176,6 +198,7 @@ interface PatientIntake {
 Audio recordings and consultation reports are stored in an S3 bucket (`AWS_S3_BUCKET`).
 
 ### Key Hierarchy
+
 ```
 s3://<AWS_S3_BUCKET>/
 ├── audio/
@@ -193,11 +216,13 @@ s3://<AWS_S3_BUCKET>/
 
 ---
 
-## 5. Real-Time Consultation & WebSocket Pipeline
+## 5. Real-Time Consultation & Serverless Voice Pipeline
 
-The live consultation interface communicates through Socket.io (`lib/websocket-service.ts`):
+The live consultation interface runs on a serverless-native rolling audio pipeline:
 
-1. **Client Connection**: Doctor and/or patient connects to the consultation room using the session ID.
-2. **Audio Streaming**: Audio chunks recorded via `react-mic` or MediaStream API are converted to WAV format and sent over the WebSocket.
-3. **Live Processing**: The audio stream triggers transcription and parallel Bedrock prompt execution, returning interim notes and suggestions back to the UI.
-4. **Session Finalization**: On session end, audio is committed to S3, final transcripts are saved to DynamoDB, and Bedrock Nova generates the structured SOAP note.
+1. **Zero-Latency Live Transcription**: Browser Web Speech API provides instant, on-screen text transcription as the doctor and patient speak.
+2. **Incremental Audio Chunking**: `MediaRecorder` captures rolling 10-second timeslices (~150KB per chunk), completely avoiding Vercel's 4.5MB serverless payload limit.
+3. **Serverless Transcription & S3 Archival**: Each 10s chunk is streamed to `/api/sessions/voice`, persisted to S3, and transcribed via Amazon Bedrock Nova Sonic.
+4. **Incremental DynamoDB Persistence**: Transcripts are automatically compiled into the session record in DynamoDB on each chunk, safeguarding against tab crashes or network drops.
+5. **Mid-Consultation Clinical Suggestions**: Bedrock generates real-time differential diagnosis considerations and alerts as the conversation progresses.
+6. **Instant Session Finalization**: Because the transcript is already assembled in DynamoDB throughout the call, generating the final structured SOAP note via Bedrock Nova Pro/Lite takes only 2–3 seconds when the doctor ends the session.
